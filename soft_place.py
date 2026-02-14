@@ -1,4 +1,11 @@
-# soft_place - a simple solver for differentiable k-median problem on graphs
+""""
+soft_place
+
+a simple solver for a differentiable k-median / facility-location
+problem on graphs
+
+
+"""
 
 import networkx as nx
 import numpy as np
@@ -7,16 +14,16 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 
-# graph utilities
 def make_random_geometric_graph(n=50, radius=0.25, seed=1):
+    """
+    Creates geometric graph with node positions and Euclidean edge weights.
+    """
     G = nx.random_geometric_graph(n, radius, seed=seed)
-    # ensure connectivity; if not, connect components
     if not nx.is_connected(G):
         comps = list(nx.connected_components(G))
         for a, b in zip(comps[:-1], comps[1:]):
             ua = next(iter(a)); vb = next(iter(b))
             G.add_edge(ua, vb)
-    # assign Euclidean distances as edge weight
     pos = nx.get_node_attributes(G, 'pos')
     for u, v in G.edges():
         x1, y1 = pos[u]; x2, y2 = pos[v]
@@ -24,85 +31,120 @@ def make_random_geometric_graph(n=50, radius=0.25, seed=1):
         G[u][v]['weight'] = d
     return G
 
+
 def compute_shortest_path_distance_matrix(G):
+    """
+    Computes dense all-pairs shortest-path distances (D[i,j] = dist from node i to j).
+    """
     n = G.number_of_nodes()
     nodes = list(G.nodes())
-    index = {node:i for i,node in enumerate(nodes)}
-    D = np.zeros((n,n), dtype=float)
+    index = {node: i for i, node in enumerate(nodes)}
+    D = np.zeros((n, n), dtype=float)
     for u in nodes:
         lengths = nx.single_source_dijkstra_path_length(G, u, weight='weight')
         for v, L in lengths.items():
             D[index[u], index[v]] = L
     return D, nodes
 
-# differentiable model
+
 class SoftPlaceFacilityModel(nn.Module):
+    """
+    Neural soft-place facility location solver through continuous relaxation.
+
+    We have one learnable scalar per node (s_logits).
+    Convert logits -> strengths -> soft facility selection.
+    """
     def __init__(self, n_nodes, k, beta=5.0, opening_cost=0.1):
         super().__init__()
         self.n = n_nodes
         self.k = k
         self.beta = beta
         self.opening_cost = opening_cost
-        # logits controlling facility strengths per node
-        self.s_logits = nn.Parameter(torch.zeros(n_nodes))  # initialize neutral
+
+        # learnable logits: higher logit -> node becomes a stronger facility after softmax
+        self.s_logits = nn.Parameter(torch.zeros(n_nodes))
+        self.eps = 1e-9
+
     def forward(self, D, demand):
-        # D: (n,n) tensor of distances
-        # demand: (n,) tensor
-        # facility strengths s in [0,inf) but normalized to sum ~k
+        # D: (n,n) distances
+        # demand: (n,) nonnegative weights
+
+        # normalize logits to a probability vector, then scale so strengths sum to k
+        # reason: soft budget enforcement that remains differentiable
         s_softmax = torch.softmax(self.s_logits, dim=0)  # sums to 1
-        s = s_softmax * self.k  # sum(s) = k (soft)
-        # compute attraction a_ij = s_j * exp(-beta * D_ij)
-        # D shape (n_customers, n_facilities) — here same n
-        A = s.unsqueeze(0) * torch.exp(-self.beta * D)  # (n,n)
-        P = A / (A.sum(dim=1, keepdim=True) + 1e-9)      # assignment probabilities
-        # expected distance per customer i = sum_j P_ij * D_ij
+        s = s_softmax * self.k                            # sum(s) ≈ k
+
+        # attraction: facility j attracts customer i proportional to s_j * exp(-beta * dist_ij).
+        # strong nearby facilities score high
+        A = s.unsqueeze(0) * torch.exp(-self.beta * D)   # shape (n_customers, n_facilities)
+
+        # soft assignment: normalize attraction to obtain per-customer assignment probabilities
+        # a differentiable twin of "assign each customer to nearest open facility"
+        P = A / (A.sum(dim=1, keepdim=True) + self.eps)  # shape (n, n)
+
+        # expected distance per customer under soft assignment
         exp_dist = (P * D).sum(dim=1)  # (n,)
+
+        # final loss: demand-weighted expected distance + linear opening penalty
         cost = (demand * exp_dist).sum() + self.opening_cost * s.sum()
+
+        # return cost (for optimization) and detached diagnostics
         return cost, s.detach().cpu().numpy(), P.detach().cpu().numpy()
 
-# demo / training loop
+
 def run_demo(n=50, k=3, iters=1000, lr=0.5, seed=1):
     G = make_random_geometric_graph(n=n, seed=seed)
     D_np, nodes = compute_shortest_path_distance_matrix(G)
-    # synthetic demand per node (random)
+
+    # generating synthetic demand per node (normalized so total demand ~= n)
     rng = np.random.RandomState(seed)
     demand = rng.rand(n).astype(float)
-    demand = demand / demand.sum() * n  # scale so total demand ~ n
-    # prepare tensors
+    demand = demand / demand.sum() * n
+
+    # tensors used in optimization
     D = torch.tensor(D_np, dtype=torch.float32)
     demand_t = torch.tensor(demand, dtype=torch.float32)
+
+    # model and optimizer
     model = SoftPlaceFacilityModel(n, k, beta=5.0, opening_cost=0.05)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # optimize logits to minimize differentiable objective
     for it in range(iters):
         opt.zero_grad()
+        # cost depends differentiably on s_logits
         cost, s_vals, _ = model(D, demand_t)
+        # gradients flow back into s_logits
         cost.backward()
         opt.step()
-        if it % (iters//5) == 0 or it == iters-1:
+        if it % (max(1, iters // 5)) == 0 or it == iters - 1:
+            # show which nodes currently have largest learned strength
             print(f"iter {it:4d} cost {cost.item():.4f} top_s: {np.argsort(-s_vals)[:k].tolist()}")
-    # final
+
+    # select top-k by learned strength and plot
     cost, s_vals, P = model(D, demand_t)
     topk_nodes_idx = list(np.argsort(-s_vals)[:k])
-    topk_nodes = [nodes[i] for i in topk_nodes_idx]
     print("Final top-k node indices:", topk_nodes_idx)
     plot_solution(G, nodes, s_vals, topk_nodes_idx)
     return G, nodes, s_vals, topk_nodes_idx
 
+
 def plot_solution(G, nodes, s_vals, topk_idx):
+    """
+    Visualizes node strengths (by size) and highlights selected facilities.
+    """
     pos = nx.get_node_attributes(G, 'pos')
-    fig, ax = plt.subplots(figsize=(6,6))
-    # draw graph
+    fig, ax = plt.subplots(figsize=(6, 6))
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
     sizes = (s_vals - s_vals.min() + 1e-6)
     sizes = 200 * sizes / sizes.max()
     nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color='C0', ax=ax)
-    # highlight chosen facilities
     facility_nodes = [nodes[i] for i in topk_idx]
     nx.draw_networkx_nodes(G, pos, nodelist=facility_nodes, node_size=300, node_color='C1', ax=ax)
-    ax.set_title("Learned facility strengths (size) and chosen facilities (orange)")
+    ax.set_title("Learned strengths (size); chosen facilities (orange)")
     plt.axis('off')
     plt.show()
 
-# Run the demo
+
 if __name__ == "__main__":
     run_demo(n=80, k=4, iters=800, lr=0.3, seed=42)
